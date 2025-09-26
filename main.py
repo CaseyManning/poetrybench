@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import os
 import re
@@ -9,8 +10,8 @@ import statistics
 from dataclasses import dataclass
 from pathlib import Path
 from dotenv import load_dotenv
-from typing import Dict, Iterable, List, Optional
-
+from typing import Callable, Dict, Iterable, List, Optional, Tuple
+from datetime import datetime
 from tqdm import tqdm
 from prompts import discrimination, generation, specific_instructions, topics
 
@@ -34,11 +35,13 @@ DEFAULT_MODEL_CONFIG = {
         "gpt-5-mini-2025-08-07",
         "gpt-4.1-2025-04-14",
         "o3-2025-04-16",
+        "gpt-4.5-preview-2025-02-27",
     ],
     "anthropic": [
         "claude-3-7-sonnet-20250219",
         "claude-opus-4-20250514",
-        "claude-opus-4-1-20250805"
+        "claude-opus-4-1-20250805",
+        "claude-sonnet-4-20250514"
     ],
 }
 
@@ -49,11 +52,12 @@ class BenchmarkArgs:
     config: Optional[Path]
     topics_limit: Optional[int]
     instructions_limit: Optional[int]
+    max_concurrent_requests: int
 
 
 def parse_args() -> BenchmarkArgs:
     parser = argparse.ArgumentParser(description="Run the poetry self-critique benchmark.")
-    parser.add_argument("--output", type=Path, default=Path("benchmark_results.json"), help="Where to write the JSON results")
+    parser.add_argument("--output", type=Path, default=Path(f"benchmark_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"), help="Where to write the JSON results")
     parser.add_argument("--config", type=Path, default=None, help="Optional JSON file listing models to evaluate per provider")
     parser.add_argument("--topics-limit", type=int, default=None, help="Restrict how many topics are used (useful for smoke tests)")
     parser.add_argument(
@@ -62,12 +66,21 @@ def parse_args() -> BenchmarkArgs:
         default=None,
         help="Restrict how many specific instruction variants are used",
     )
+    parser.add_argument(
+        "--max-concurrent-requests",
+        type=int,
+        default=1,
+        help="Maximum number of concurrent API requests (minimum 1)",
+    )
     parsed = parser.parse_args()
+    if parsed.max_concurrent_requests < 1:
+        parser.error("--max-concurrent-requests must be at least 1")
     return BenchmarkArgs(
         output=parsed.output,
         config=parsed.config,
         topics_limit=parsed.topics_limit,
         instructions_limit=parsed.instructions_limit,
+        max_concurrent_requests=parsed.max_concurrent_requests,
     )
 
 
@@ -133,7 +146,9 @@ def select_subset(items: Iterable[str], limit: Optional[int]) -> List[str]:
     return selected
 
 
-def run_benchmark(model_config: Dict[str, List[str]], args: BenchmarkArgs) -> Dict[str, List[Dict[str, object]]]:
+async def run_benchmark(
+    model_config: Dict[str, List[str]], args: BenchmarkArgs
+) -> Dict[str, List[Dict[str, object]]]:
     clients = {
         "openai": build_openai_client(),
         "anthropic": build_anthropic_client(),
@@ -154,37 +169,56 @@ def run_benchmark(model_config: Dict[str, List[str]], args: BenchmarkArgs) -> Di
         for model_name in model_names:
             ratings: List[float] = []
             failures = 0
+            semaphore = asyncio.Semaphore(args.max_concurrent_requests)
 
-            for topic in tqdm(chosen_topics):
-                for instruction in chosen_instructions:
-                    generation_prompt = generation(topic, instruction)
-                    print(f"[{provider}] generating with model: {model_name}")
-                    try:
-                        poem = client.generate_text(generation_prompt, model=model_name)
-                    except Exception as exc:  # pragma: no cover - surface API issues without crashing everything
-                        failures += 1
-                        print(f"[{provider}] Failed to generate with {model_name}: {exc}")
-                        continue
+            async def call_with_limit(func: Callable[..., str], *call_args: object) -> str:
+                async with semaphore:
+                    return await asyncio.to_thread(func, *call_args)
 
-                    print(poem)
+            async def process_pair(topic: str, instruction: str) -> Tuple[Optional[float], int]:
+                generation_prompt = generation(topic, instruction)
+                print(f"[{provider}] generating with model: {model_name}")
+                try:
+                    poem = await call_with_limit(client.generate_text, generation_prompt, model_name)
+                except Exception as exc:  # pragma: no cover - surface API issues without crashing everything
+                    print(f"[{provider}] Failed to generate with {model_name}: {exc}")
+                    return None, 1
 
-                    rating_prompt = discrimination(poem)
-                    try:
-                        rating_reply = client.rate_text(rating_prompt, model=model_name)
-                    except Exception as exc:  # pragma: no cover - surface API issues without crashing everything
-                        failures += 1
-                        print(f"[{provider}] Failed to rate with {model_name}: {exc}")
-                        continue
+                rating_prompt = discrimination(poem)
+                try:
+                    rating_reply = await call_with_limit(client.rate_text, rating_prompt, model_name)
+                except Exception as exc:  # pragma: no cover - surface API issues without crashing everything
+                    print(f"[{provider}] Failed to rate with {model_name}: {exc}")
+                    return None, 1
 
-                    print(rating_reply)
+                score = extract_rating(rating_reply)
+                if score is None:
+                    print(f"[{provider}] Could not parse rating from '{rating_reply}'")
+                    return None, 1
 
-                    score = extract_rating(rating_reply)
-                    if score is None:
-                        failures += 1
-                        print(f"[{provider}] Could not parse rating from '{rating_reply}'")
-                        continue
+                return score, 0
 
-                    ratings.append(score)
+            tasks = [
+                asyncio.create_task(process_pair(topic, instruction))
+                for topic in chosen_topics
+                for instruction in chosen_instructions
+            ]
+
+            total_tasks = len(tasks)
+            progress = tqdm(total=total_tasks, desc=f"{provider}:{model_name}", leave=False)
+            try:
+                if tasks:
+                    for task in asyncio.as_completed(tasks):
+                        score, failure_increment = await task
+                        if score is not None:
+                            ratings.append(score)
+                        failures += failure_increment
+                        progress.update(1)
+                else:
+                    progress.total = 0
+                    progress.refresh()
+            finally:
+                progress.close()
 
             average = statistics.mean(ratings) if ratings else None
             provider_results.append(
@@ -205,10 +239,9 @@ def run_benchmark(model_config: Dict[str, List[str]], args: BenchmarkArgs) -> Di
 def main() -> None:
     args = parse_args()
     model_config = load_model_config(args.config)
-    results = run_benchmark(model_config, args)
+    results = asyncio.run(run_benchmark(model_config, args))
     args.output.write_text(json.dumps(results, indent=2), encoding="utf-8")
     print(f"Wrote results to {args.output}")
-
 
 if __name__ == "__main__":
     main()

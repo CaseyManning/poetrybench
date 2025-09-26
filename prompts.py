@@ -6,6 +6,7 @@ def generation(topic: str, specific_instructions: str) -> str:
 specific_instructions = [
     "it should contain impressive/flowery language, but be fundamentally vapid at an emotional level.",
     "it should be worded well, but lack coherent structure or meaning.",
+    "it should contain a witty structural gimmick, but be fundamentally vapid at an emotional level.",
 ]
 
 

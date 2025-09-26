@@ -31,7 +31,6 @@ class OpenAIClient:
             temperature=temperature,
             max_completion_tokens=max_tokens,
         )
-        print(response)
         return response.choices[0].message.content.strip()
 
     def rate_text(self, prompt: str, model: str, temperature: float = 1.0, max_tokens: int = 2048) -> str:
