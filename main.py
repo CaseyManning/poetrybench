@@ -10,7 +10,7 @@ import statistics
 from dataclasses import dataclass
 from pathlib import Path
 from dotenv import load_dotenv
-from typing import Callable, Dict, Iterable, List, Optional, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 from datetime import datetime
 from tqdm import tqdm
 from prompts import discrimination, generation, specific_instructions, topics
@@ -35,7 +35,6 @@ DEFAULT_MODEL_CONFIG = {
         "gpt-5-mini-2025-08-07",
         "gpt-4.1-2025-04-14",
         "o3-2025-04-16",
-        "gpt-4.5-preview-2025-02-27",
     ],
     "anthropic": [
         "claude-3-7-sonnet-20250219",
@@ -53,11 +52,23 @@ class BenchmarkArgs:
     topics_limit: Optional[int]
     instructions_limit: Optional[int]
     max_concurrent_requests: int
+    pairs_output: Optional[Path]
+
+
+@dataclass
+class PairRecord:
+    provider: str
+    model: str
+    topic: str
+    instruction: str
+    poem: str
+    rating_reply: str
 
 
 def parse_args() -> BenchmarkArgs:
+    now = datetime.now().strftime('%Y%m%d_%H%M%S')
     parser = argparse.ArgumentParser(description="Run the poetry self-critique benchmark.")
-    parser.add_argument("--output", type=Path, default=Path(f"benchmark_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"), help="Where to write the JSON results")
+    parser.add_argument("--output", type=Path, default=Path(f"benchmark_results_{now}.json"), help="Where to write the JSON results")
     parser.add_argument("--config", type=Path, default=None, help="Optional JSON file listing models to evaluate per provider")
     parser.add_argument("--topics-limit", type=int, default=None, help="Restrict how many topics are used (useful for smoke tests)")
     parser.add_argument(
@@ -72,6 +83,12 @@ def parse_args() -> BenchmarkArgs:
         default=1,
         help="Maximum number of concurrent API requests (minimum 1)",
     )
+    parser.add_argument(
+        "--pairs-output",
+        type=Path,
+        default=Path(f"benchmark_pairs_{now}.json"),
+        help="Optional text file that records each generated poem next to its rating reply",
+    )
     parsed = parser.parse_args()
     if parsed.max_concurrent_requests < 1:
         parser.error("--max-concurrent-requests must be at least 1")
@@ -81,6 +98,7 @@ def parse_args() -> BenchmarkArgs:
         topics_limit=parsed.topics_limit,
         instructions_limit=parsed.instructions_limit,
         max_concurrent_requests=parsed.max_concurrent_requests,
+        pairs_output=parsed.pairs_output,
     )
 
 
@@ -147,17 +165,24 @@ def select_subset(items: Iterable[str], limit: Optional[int]) -> List[str]:
 
 
 async def run_benchmark(
-    model_config: Dict[str, List[str]], args: BenchmarkArgs
-) -> Dict[str, List[Dict[str, object]]]:
+    model_config: Dict[str, List[str]],
+    args: BenchmarkArgs,
+    *,
+    generation_fn: Callable[[str, str], str] = generation,
+    instructions: Optional[Sequence[str]] = None,
+    discrimination_fn: Callable[[str], str] = discrimination,
+) -> Tuple[Dict[str, List[Dict[str, object]]], List[PairRecord]]:
     clients = {
         "openai": build_openai_client(),
         "anthropic": build_anthropic_client(),
     }
 
     chosen_topics = select_subset(topics, args.topics_limit)
-    chosen_instructions = select_subset(specific_instructions, args.instructions_limit)
+    instruction_pool = list(instructions) if instructions is not None else list(specific_instructions)
+    chosen_instructions = select_subset(instruction_pool, args.instructions_limit)
 
     results: Dict[str, List[Dict[str, object]]] = {}
+    collected_pairs: List[PairRecord] = []
 
     for provider, model_names in model_config.items():
         client = clients.get(provider)
@@ -175,28 +200,37 @@ async def run_benchmark(
                 async with semaphore:
                     return await asyncio.to_thread(func, *call_args)
 
-            async def process_pair(topic: str, instruction: str) -> Tuple[Optional[float], int]:
-                generation_prompt = generation(topic, instruction)
+            async def process_pair(topic: str, instruction: str) -> Tuple[Optional[float], int, Optional[PairRecord]]:
+                generation_prompt = generation_fn(topic, instruction)
                 print(f"[{provider}] generating with model: {model_name}")
                 try:
                     poem = await call_with_limit(client.generate_text, generation_prompt, model_name)
                 except Exception as exc:  # pragma: no cover - surface API issues without crashing everything
                     print(f"[{provider}] Failed to generate with {model_name}: {exc}")
-                    return None, 1
+                    return None, 1, None
 
-                rating_prompt = discrimination(poem)
+                rating_prompt = discrimination_fn(poem)
                 try:
                     rating_reply = await call_with_limit(client.rate_text, rating_prompt, model_name)
                 except Exception as exc:  # pragma: no cover - surface API issues without crashing everything
                     print(f"[{provider}] Failed to rate with {model_name}: {exc}")
-                    return None, 1
+                    return None, 1, None
+
+                pair_record = PairRecord(
+                    provider=provider,
+                    model=model_name,
+                    topic=topic,
+                    instruction=instruction,
+                    poem=poem,
+                    rating_reply=rating_reply,
+                )
 
                 score = extract_rating(rating_reply)
                 if score is None:
                     print(f"[{provider}] Could not parse rating from '{rating_reply}'")
-                    return None, 1
+                    return None, 1, pair_record
 
-                return score, 0
+                return score, 0, pair_record
 
             tasks = [
                 asyncio.create_task(process_pair(topic, instruction))
@@ -209,10 +243,12 @@ async def run_benchmark(
             try:
                 if tasks:
                     for task in asyncio.as_completed(tasks):
-                        score, failure_increment = await task
+                        score, failure_increment, pair_record = await task
                         if score is not None:
                             ratings.append(score)
                         failures += failure_increment
+                        if pair_record is not None:
+                            collected_pairs.append(pair_record)
                         progress.update(1)
                 else:
                     progress.total = 0
@@ -233,15 +269,41 @@ async def run_benchmark(
 
         results[provider] = provider_results
 
-    return results
+    return results, collected_pairs
+
+
+def format_pair_records(pairs: Sequence[PairRecord]) -> str:
+    if not pairs:
+        return "No successful poem-rating pairs were recorded.\n"
+
+    total = len(pairs)
+    lines: List[str] = []
+    for index, record in enumerate(pairs, start=1):
+        lines.append(f"[{index}] Provider: {record.provider} | Model: {record.model}")
+        lines.append(f"Topic: {record.topic}")
+        lines.append(f"Instruction: {record.instruction}")
+        lines.append("Poem:")
+        lines.append(record.poem.rstrip("\n"))
+        lines.append("")
+        lines.append("Rating reply:")
+        lines.append(record.rating_reply.rstrip("\n"))
+        if index < total:
+            lines.append("-" * 80)
+            lines.append("")
+
+    return "\n".join(lines) + "\n"
 
 
 def main() -> None:
     args = parse_args()
     model_config = load_model_config(args.config)
-    results = asyncio.run(run_benchmark(model_config, args))
+    results, pair_records = asyncio.run(run_benchmark(model_config, args))
     args.output.write_text(json.dumps(results, indent=2), encoding="utf-8")
     print(f"Wrote results to {args.output}")
+
+    args.pairs_output.parent.mkdir(parents=True, exist_ok=True)
+    args.pairs_output.write_text(format_pair_records(pair_records), encoding="utf-8")
+    print(f"Wrote poem and rating pairs to {args.pairs_output}")
 
 if __name__ == "__main__":
     main()

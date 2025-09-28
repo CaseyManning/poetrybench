@@ -10,9 +10,9 @@ specific_instructions = [
 ]
 
 
-def discrimination(poem: str) -> str:
+def discrimination(poem: str, verbose: bool = False) -> str:
     return f"""
-    think about this poem, and give it a rating from 1 to 10, as an overall measure of its quality as a literary work.
+    think about this poem, and give it a rating from 1 to 10, as an overall measure of its quality as a literary work. {"" if verbose else "do not output any text other than the numerical rating."}
 
     {poem}
     """
@@ -39,3 +39,8 @@ topics = [
     "despair",
     "dreams",
 ]
+
+def generation_good(topic: str, specific_instructions: str) -> str:
+    return f"""
+    write a 10 line poem about {topic}. {specific_instructions} do not return any text other than the poem.
+    """

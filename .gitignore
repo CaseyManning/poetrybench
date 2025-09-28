@@ -1,5 +1,5 @@
 .env
 __pycache__
 */__pycache__
-benchmark_results_*.json
+*.json
 .pycache
